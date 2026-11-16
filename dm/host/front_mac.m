@@ -1,7 +1,7 @@
 // Mac front end: with DM_WINDOW=1 open a window (CAMetalLayer, for the graphics backend to present frames) + keyboard and controllers → dm_input; the guest runs on a large-stack thread instead and the main thread belongs to AppKit.
 // Without DM_WINDOW: the guest runs directly on the current thread, behaving the same as with no front end (windowless tests use this).
 // The window is fullscreen-capable (the green button and ⌃⌘F); DM_FULLSCREEN=1 starts it that way. ⌘Q quits, and so does a controller's Home button held for 2 s and
-// confirmed with A (home_quit.h); the left mouse button is the touchscreen.
+// confirmed with A (home_quit.h). Left drag is the touchscreen and right drag is the right stick.
 // Cheats (hle_cheats.c): the Cheats menu's rows toggle, reload (⌘R) and open the cheats folder; its first item "Show Cheats
 // Window" (⌘⇧C, or DM_CHEATS_WINDOW=1 at launch) opens a Cheats panel beside the game: sections, search, the master switch,
 // safe mode, values, details and the import of cheat files (see the code below).
@@ -40,6 +40,9 @@ static CAMetalLayer *g_layer;
 static uint64_t g_btn;
 static int g_w, g_a, g_s, g_d;
 static int g_rl, g_ru, g_rr, g_rd;   // arrow keys pressed with Shift held: the right stick (each goes back up as it went down, whatever Shift does meanwhile)
+static int g_mouse_stick_down;
+static NSPoint g_mouse_stick_origin;
+static int32_t g_mouse_rx, g_mouse_ry;
 static int g_input_on = 1;   // main thread: the game window is key, so its keyboard, mouse and controllers reach the game (input_release / input_resume)
 
 void *front_metal_layer(void) { return (__bridge void *)g_layer; }
@@ -136,7 +139,7 @@ void front_screen_match(int fps) {
     g_match_want = fps; dispatch_async(dispatch_get_main_queue(), ^{ screen_match_apply(); });
 }
 // The pointer hides on game input while it is over the picture of the active game window (issue #675): AppKit shows it again when the mouse moves, input_release when
-// the window loses focus. The title bar, other windows and other apps keep theirs; the mouse is the touch screen (DmGameView), and moving it shows the pointer
+// the window loses focus. The title bar, other windows and other apps keep theirs, and moving the mouse shows the pointer.
 static void cursor_hide_for_input(void) {
     if (!g_win.isKeyWindow || !NSApp.isActive) return;
     NSView *v = g_win.contentView;
@@ -144,7 +147,9 @@ static void cursor_hide_for_input(void) {
 }
 static void push(void) {
     int32_t lx = (g_d - g_a) * 32767, ly = (g_w - g_s) * 32767;
-    int32_t rx = (g_rr - g_rl) * 32767, ry = (g_ru - g_rd) * 32767;
+    int keyboard_stick = g_rl || g_ru || g_rr || g_rd;
+    int32_t rx = keyboard_stick ? (g_rr - g_rl) * DM_STICK_MAX : g_mouse_rx;
+    int32_t ry = keyboard_stick ? (g_ru - g_rd) * DM_STICK_MAX : g_mouse_ry;
     dm_input_set(g_btn, lx, ly, rx, ry);
 }
 static int key_bit(unsigned short code) {
@@ -320,6 +325,16 @@ static void display_awake(int on) {
 // stay pressed in the game. The front end releases only what it pressed itself: scripted buttons and sticks have their own path, and the touch is also DM_KEYS / DM_CTL's (hle_hid.c).
 // Out of focus a controller's changes are ignored, so back in focus each controller is read as it is now (a button still held, a stick still deflected)
 static int g_mouse_down;   // the mouse holds the touch (DmGameView)
+static void mouse_stick_release(void) {
+    g_mouse_stick_down = 0;
+    g_mouse_rx = g_mouse_ry = 0;
+}
+static void keyboard_mouse_release(void) {
+    g_btn = 0; g_w = g_a = g_s = g_d = 0; g_rl = g_ru = g_rr = g_rd = 0;
+    mouse_stick_release();
+    push();
+    if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); }
+}
 // Nothing the controllers pressed stays pressed (focus lost, the Home quit prompt open)
 static void pads_release(void) {
     if (g_merge) { if (merge_pads_left(nil)) dm_pad_set(0, 0, 0, 0, 0); return; }
@@ -347,8 +362,7 @@ static void input_release(void) {
     g_input_on = 0;
     dm_motion_pro_active(0); hidpad_motion_clear();
     dm_switch2_active(0); dm_jc1_active(0);
-    g_btn = 0; g_w = g_a = g_s = g_d = 0; g_rl = g_ru = g_rr = g_rd = 0; push();
-    if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); }
+    keyboard_mouse_release();
     pads_release();
 }
 static void input_resume(void) {
@@ -540,6 +554,7 @@ static void hq_changed(hq_phase was, hq_phase now, GCController *holder) {
         break;
     case HQ_PROMPT: {
         pads_release();   // nothing the game held stays pressed while the prompt has the controllers
+        mouse_stick_release(); push();
         if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); }
         dm_focus_set(2);
         GCExtendedGamepad *g = holder.extendedGamepad;
@@ -635,8 +650,7 @@ int front_ctrl_support(int min, int max) {
     if (!g_layer) return -1;
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     dispatch_async(dispatch_get_main_queue(), ^{
-        g_btn = 0; g_w = g_a = g_s = g_d = 0; g_rl = g_ru = g_rr = g_rd = 0; push();   // nothing the game held stays pressed while the prompt has the input
-        if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); }
+        keyboard_mouse_release();   // nothing the game held stays pressed while the prompt has the input
         pads_release();
         int a, b; cp_buttons(&a, &b);
         g_cp_done = done; cp_open(&g_cp, min, max, dm_players_reported(), a, b);
@@ -684,6 +698,28 @@ void front_picture_shape(int w, int h) { if (w > 0 && h > 0) g_picture_aspect = 
     dm_touch_set(&t, 1); g_mouse_down = 1;
 }
 - (void)mouseUp:(NSEvent *)e { (void)e; if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); } }
+// The right-button press sets the stick's neutral point. Drag distance (in AppKit points) controls its deflection.
+- (void)rightMouseDown:(NSEvent *)e {
+    if (!g_input_on || cp_blocks_input(g_cp.phase) || hq_blocks_input(g_hq.phase)) return;
+    g_mouse_stick_origin = e.locationInWindow;
+    g_mouse_stick_down = 1;
+}
+- (void)rightMouseDragged:(NSEvent *)e {
+    if (!g_mouse_stick_down) return;
+    NSPoint p = e.locationInWindow;
+    double dx = p.x - g_mouse_stick_origin.x, dy = p.y - g_mouse_stick_origin.y;
+    const double full_deflection = 80.0;
+    double scale = DM_STICK_MAX / fmax(full_deflection, hypot(dx, dy));
+    g_mouse_rx = (int32_t)(dx * scale);
+    g_mouse_ry = (int32_t)(dy * scale);
+    push();
+}
+- (void)rightMouseUp:(NSEvent *)e {
+    (void)e;
+    if (!g_mouse_stick_down) return;
+    mouse_stick_release();
+    push();
+}
 // The drawable follows the view in pixels: a layer assigned to a layer-backed view kept the drawable at the first window's 1280x720 in fullscreen too, so the game picture was
 // scaled down to it and up again by the compositor
 - (void)fitDrawable {
@@ -1728,7 +1764,7 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
     dispatch_sync(dispatch_get_main_queue(), ^{
         // The box takes the keyboard and the mouse, so the game window never sees the key-up of the button or the touch-up of the click that opened it: nothing may stay pressed
         // while it is up, or the game reads the stuck button / touch the moment the box closes (Stardew Valley's character creation re-opened the keyboard endlessly)
-        g_btn = 0; g_w = g_a = g_s = g_d = 0; g_rl = g_ru = g_rr = g_rd = 0; push();
+        keyboard_mouse_release();
         dm_touch_set(NULL, 0);
         int min_chars = g_swkbd_min_chars > 0 ? g_swkbd_min_chars : 0;
         NSString *info = [NSString stringWithFormat:@"%s%s%s", sub ? sub : "", sub && *sub && guide && *guide ? "\n" : "", guide ? guide : ""];
