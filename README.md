@@ -151,3 +151,13 @@ This project is built on other people's work ([licenses](dm/third_party/README.m
 ## License
 
 MIT ([LICENSE](LICENSE)). Third-party code keeps its own license ([dm/third_party](dm/third_party/README.md)).
+
+## LTV
+
+python3 -m venv .venv     
+
+source .venv/bin/activate
+
+python -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic 
+
+python scripts/build_ipa_from_nsp.py "/Users/mac/Downloads/Fire-Emblem-Fortunes-Weave-NS2/FEFW ROM/131072" --platform mac-app
